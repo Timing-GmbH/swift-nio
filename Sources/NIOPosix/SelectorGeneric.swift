@@ -232,6 +232,15 @@ internal class Selector<R: Registration> {
     /// indexes rather than a parallel boolean array for O(1) lookup during cleanup.
     @usableFromInline
     var deregisteredFDs = Set<Int>()
+    /// Handles temporarily withdrawn from `pollFDs` because `WSAPoll` had nothing left to tell us
+    /// about them but would not stop saying so. `POLLHUP` cannot be masked — measured, it is
+    /// delivered even for `events == 0` and stays set for the whole remaining life of a half-closed
+    /// socket — so a registration that is down to `[.reset, .error]` after its EOF has been
+    /// delivered would make every `WSAPoll` return instantly and spin the loop at 100 % CPU.
+    /// Withdrawing the entry is the only way to make the wait block again; `reregister0` re-admits
+    /// it as soon as the channel is interested in anything else.
+    @usableFromInline
+    var parkedFDs = Set<NIOBSDSocket.Handle>()
     /// The read end of the wakeup socket pair. This is monitored in WSAPoll to allow waking up the event loop.
     @usableFromInline
     var wakeupReadSocket: NIOBSDSocket.Handle = NIOBSDSocket.invalidHandle

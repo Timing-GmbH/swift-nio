@@ -67,7 +67,33 @@ extension SelectorEventSet {
             self.formUnion(.error)
         }
         if mapped & WinSDK.POLLHUP != 0 {
-            self.formUnion(.reset)
+            // Winsock collapses what epoll splits across EPOLLRDHUP and
+            // EPOLLHUP into this single bit, so which of the two it means has
+            // to be recovered from POLLERR. Measured on Windows 11 (26200),
+            // one socket per row:
+            //
+            //   peer shutdown(SD_SEND), socket still open   ->  HUP
+            //   peer sends 5 bytes then shutdown(SD_SEND)   ->  HUP|RDNORM
+            //   peer closesocket()                          ->  HUP
+            //   peer RST (SO_LINGER 0)                      ->  HUP|ERR
+            //   refused non-blocking connect                ->  HUP|ERR|WRNORM
+            //
+            // So POLLHUP on its own is a *plain peer FIN* and nothing more:
+            // measured, a `send()` of 14 bytes issued while WSAPoll was already
+            // reporting POLLHUP succeeded and the peer received all 14. That is
+            // EPOLLRDHUP, i.e. `.readEOF` — reporting it as `.reset` would tear
+            // the connection down on every orderly close, discarding whatever
+            // was flushed but not yet written, because
+            // `SelectableEventLoop.handleEvent`'s `.reset` arm short-circuits
+            // `writable()`.
+            //
+            // POLLERR alongside it *is* a reset or a failed connect, which is
+            // also how a RST surfaces on epoll (EPOLLERR|EPOLLHUP).
+            if mapped & WinSDK.POLLERR != 0 {
+                self.formUnion(.reset)
+            } else {
+                self.formUnion(.readEOF)
+            }
         }
         if mapped & WinSDK.POLLNVAL != 0 {
             preconditionFailure("Invalid fd supplied.")
@@ -138,7 +164,21 @@ extension Selector: _SelectorBackendProtocol {
 
         // Copy the path into sun_path
         let pathBytes = socketPath.utf8CString
-        precondition(pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path), "Socket path too long")
+        // A trap here would abort the process from inside `Selector.init`, i.e.
+        // from inside `MultiThreadedEventLoopGroup`, with no diagnostic — and it
+        // is reachable on a real machine, not just in theory: `sun_path` holds
+        // 108 bytes, the generated name is `<TEMP>\nio-wakeup-<pid>-<tid>-<tick>.sock`
+        // whose suffix is ~37 bytes and *grows with uptime* (`GetTickCount64` is
+        // 10 digits today, 11 after roughly four months), so any `%TEMP%` longer
+        // than about 69 characters trips it. A long user name, a redirected or
+        // roaming TEMP, or a managed enterprise profile will do it. Every other
+        // failure on this path throws, so throw here too.
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
+            throw IOError(
+                windows: DWORD(ERROR_INSUFFICIENT_BUFFER),
+                reason: "wakeup socket path does not fit in sun_path: \(socketPath)"
+            )
+        }
         withUnsafeMutableBytes(of: &addr.sun_path) { destPtr in
             pathBytes.withUnsafeBufferPointer { srcPtr in
                 destPtr.copyMemory(from: UnsafeRawBufferPointer(srcPtr))
@@ -293,8 +333,24 @@ extension Selector: _SelectorBackendProtocol {
                 -1
 
             case .blockUntilTimeout(let timeAmount):
-                Int32(clamping: timeAmount.nanoseconds / 1_000_000)
+                // Round *up*: truncating division turns every sub-millisecond
+                // deadline into 0, and `WSAPoll(…, 0)` returns immediately
+                // (measured: 0 ms, against 250 ms for a 250 ms timeout). The
+                // loop would then spin at 100 % CPU through the sub-millisecond
+                // tail of every timer expiry. Waking up to 999 µs late is
+                // correct — the deadline is re-checked after the wait — and
+                // spinning is not.
+                Int32(clamping: timeAmount.nanoseconds / 1_000_000 + (timeAmount.nanoseconds % 1_000_000 == 0 ? 0 : 1))
             }
+
+        // Retire anything deregistered since the last poll *before* polling, so
+        // WSAPoll is never handed a handle we have already closed. Doing this
+        // only after a poll that returned > 0 (as this used to) left stale
+        // entries in `pollFDs` indefinitely, because POLLNVAL entries are not
+        // counted in WSAPoll's return value (measured: rc=0 with
+        // `revents[i] == POLLNVAL`), so a stale entry can never trigger the
+        // compaction that would remove it.
+        self.compactDeregisteredPollFDs()
 
         precondition(
             !self.pollFDs.isEmpty,
@@ -304,6 +360,14 @@ extension Selector: _SelectorBackendProtocol {
         let result = self.pollFDs.withUnsafeMutableBufferPointer { ptr in
             WSAPoll(ptr.baseAddress!, UInt32(ptr.count), time)
         }
+
+        if result == WinSDK.SOCKET_ERROR {
+            throw IOError(winsock: WSAGetLastError(), reason: "WSAPoll")
+        }
+
+        // Every other backend calls this right after the wait returns and
+        // before dispatching; this one accepted the parameter and dropped it.
+        onLoopBegin()
 
         if result > 0 {
             // something has happened
@@ -335,46 +399,95 @@ extension Selector: _SelectorBackendProtocol {
                 // in any case we only want what the user is currently registered for & what we got
                 selectorEvent = selectorEvent.intersection(registration.interested)
 
+                if selectorEvent == ._none, pollFD.revents & Int16(WinSDK.POLLHUP) != 0 {
+                    // POLLHUP cannot be masked. epoll has no such problem:
+                    // `BaseSocketChannel.readEOF0` drops EPOLLRDHUP from the
+                    // interest set once EOF has been delivered, and epoll then
+                    // goes quiet. Here the bit stays set for the rest of the
+                    // socket's life — measured, including for `events == 0` —
+                    // so plainly `continue`ing would make the next WSAPoll
+                    // return instantly too and spin the loop at 100 % CPU.
+                    //
+                    // This is only reachable for a half-closed channel
+                    // (`allowRemoteHalfClosure`); without it the EOF closes the
+                    // channel and the descriptor is deregistered in the same
+                    // tick. Two cases:
+                    if registration.interested.contains(.write) {
+                        // The channel still has something to write. A
+                        // half-closed socket whose send buffer is full reports
+                        // POLLHUP *without* POLLWRNORM (measured), so WSAPoll
+                        // cannot distinguish "writable" from "not writable"
+                        // here at all. Attempting the write is the only way to
+                        // make progress: it either drains or returns
+                        // `wouldBlock` harmlessly.
+                        //
+                        // TODO: this busy-polls until the peer reads. Reporting
+                        // writability on a half-closed socket properly needs
+                        // `select()`'s writefds, which has no such ambiguity.
+                        selectorEvent = .write
+                    } else {
+                        // Nothing left to report. Withdraw the descriptor so the
+                        // next wait can actually block; `reregister0` re-admits
+                        // it the moment the channel wants anything again.
+                        let handle = NIOBSDSocket.Handle(fd)
+                        if let index = self.pollFDIndexes.removeValue(forKey: handle) {
+                            self.deregisteredFDs.insert(index)
+                            self.parkedFDs.insert(handle)
+                        }
+                        continue
+                    }
+                }
+
                 guard selectorEvent != ._none else {
                     continue
                 }
 
                 try body((SelectorEvent(io: selectorEvent, registration: registration)))
             }
-
-            // Clean up any deregistered fds in a single linear in-place compaction
-            // pass: walk `pollFDs` once with a read/write cursor, dropping entries
-            // whose index is in `deregisteredFDs` and updating `pollFDIndexes`
-            // for any surviving entry that shifted left. This is O(n) and avoids
-            // both the previous `sorted(by: >)` (O(k log k)) and per-call
-            // `pollFDs.remove(at:)` (O(n) each, O(k·n) total).
-            //
-            // The wakeup socket is always at `pollFDs[0]` and is never registered
-            // in `pollFDIndexes`, so we treat index 0 as a fixed survivor.
-            if !self.deregisteredFDs.isEmpty {
-                var write = 0
-                for read in 0..<self.pollFDs.count {
-                    if self.deregisteredFDs.contains(read) {
-                        let fd = self.pollFDs[read].fd
-                        self.registrations.removeValue(forKey: Int(fd))
-                        continue
-                    }
-                    if write != read {
-                        self.pollFDs[write] = self.pollFDs[read]
-                        if write != 0 {
-                            self.pollFDIndexes[NIOBSDSocket.Handle(self.pollFDs[write].fd)] = write
-                        }
-                    }
-                    write += 1
-                }
-                self.pollFDs.removeLast(self.pollFDs.count - write)
-                self.deregisteredFDs.removeAll(keepingCapacity: true)
-            }
-        } else if result == 0 {
-            // nothing has happened
-        } else if result == WinSDK.SOCKET_ERROR {
-            throw IOError(winsock: WSAGetLastError(), reason: "WSAPoll")
         }
+    }
+
+    /// Drops every `pollFDs` entry whose index is in `deregisteredFDs` in a
+    /// single linear in-place pass: walk once with a read/write cursor and
+    /// update `pollFDIndexes` for any surviving entry that shifted left. This is
+    /// O(n) and avoids both a `sorted(by: >)` (O(k log k)) and per-call
+    /// `pollFDs.remove(at:)` (O(n) each, O(k·n) total).
+    ///
+    /// The wakeup socket is always at `pollFDs[0]` and is never published in
+    /// `pollFDIndexes`, so index 0 is a fixed survivor.
+    ///
+    /// This deliberately does **not** touch `registrations`. `Selector.deregister`
+    /// owns that dictionary and has already removed the key by the time
+    /// `deregister0` is called, so a removal here can never do the job it looks
+    /// like it is doing — it can only fire when the handle *value* has since been
+    /// re-registered by a different socket, and then it deletes that live
+    /// registration. Winsock reuses handle values immediately and
+    /// deterministically (measured: `socket()`/`closesocket()` returned the same
+    /// handle six times running), so "the new socket got the old socket's handle"
+    /// is the normal case here, not a corner case, and a reconnect issued from
+    /// `channelInactive` — which NIO fires inline, inside this very tick — was
+    /// reproducibly orphaned: polled forever, every event dropped at the
+    /// `registrations` lookup, no error and no log.
+    @inlinable
+    func compactDeregisteredPollFDs() {
+        guard !self.deregisteredFDs.isEmpty else {
+            return
+        }
+        var write = 0
+        for read in 0..<self.pollFDs.count {
+            if self.deregisteredFDs.contains(read) {
+                continue
+            }
+            if write != read {
+                self.pollFDs[write] = self.pollFDs[read]
+                if write != 0 {
+                    self.pollFDIndexes[NIOBSDSocket.Handle(self.pollFDs[write].fd)] = write
+                }
+            }
+            write += 1
+        }
+        self.pollFDs.removeLast(self.pollFDs.count - write)
+        self.deregisteredFDs.removeAll(keepingCapacity: true)
     }
 
     func register0(
@@ -383,6 +496,10 @@ extension Selector: _SelectorBackendProtocol {
         interested: SelectorEventSet,
         registrationID: SelectorRegistrationID
     ) throws {
+        // Winsock hands a fresh socket the handle value the last one released,
+        // immediately and deterministically, so a stale entry for this value
+        // must never be allowed to speak for the new socket.
+        self.parkedFDs.remove(fileDescriptor)
         let poll = pollfd(fd: UInt64(fileDescriptor), events: interested.wsaPollEvent, revents: 0)
         self.pollFDIndexes[fileDescriptor] = self.pollFDs.count
         self.pollFDs.append(poll)
@@ -395,6 +512,21 @@ extension Selector: _SelectorBackendProtocol {
         newInterested: SelectorEventSet,
         registrationID: SelectorRegistrationID
     ) throws {
+        if self.parkedFDs.contains(fileDescriptor) {
+            // Re-admit a withdrawn descriptor as soon as the channel is
+            // interested in more than the `[.reset, .error]` every registration
+            // must carry. Note that `.readEOF` maps to no WSAPoll event bit, so
+            // this test is on the *interest set*, not on `wsaPollEvent`.
+            guard !newInterested.subtracting([.reset, .error]).isEmpty else {
+                return
+            }
+            self.parkedFDs.remove(fileDescriptor)
+            self.pollFDIndexes[fileDescriptor] = self.pollFDs.count
+            self.pollFDs.append(
+                pollfd(fd: UInt64(fileDescriptor), events: newInterested.wsaPollEvent, revents: 0)
+            )
+            return
+        }
         if let index = self.pollFDIndexes[fileDescriptor] {
             self.pollFDs[index].events = newInterested.wsaPollEvent
         }
@@ -406,6 +538,11 @@ extension Selector: _SelectorBackendProtocol {
         oldInterested: SelectorEventSet,
         registrationID: SelectorRegistrationID
     ) throws {
+        if self.parkedFDs.remove(fileDescriptor) != nil {
+            // Withdrawn descriptors are not in `pollFDs`; their old slot was
+            // queued for removal when they were parked.
+            return
+        }
         if let index = self.pollFDIndexes.removeValue(forKey: fileDescriptor) {
             self.deregisteredFDs.insert(index)
         }
@@ -445,6 +582,7 @@ extension Selector: _SelectorBackendProtocol {
             self.pollFDs.removeAll()
             self.pollFDIndexes.removeAll()
             self.deregisteredFDs.removeAll()
+            self.parkedFDs.removeAll()
         }
     }
 }
