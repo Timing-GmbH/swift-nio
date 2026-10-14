@@ -1,7 +1,8 @@
 // swift-tools-version:5.9
 //===----------------------------------------------------------------------===//
 //
-// Regression harness for the Windows selector backend (`SelectorWSAPoll.swift`).
+// Regression harness for the Windows selector backend (`SelectorWSAPoll.swift`)
+// and for the winsock error codes NIO reports.
 //
 // This is a *separate* SwiftPM package rather than a target in the root
 // manifest for one measured reason: `Tests/NIOPosixTests` does not compile on

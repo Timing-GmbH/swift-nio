@@ -150,7 +150,7 @@ class Socket: BaseSocket, SocketProtocol {
     func finishConnect() throws {
         let result: Int32 = try getOption(level: .socket, name: .so_error)
         if result != 0 {
-            throw IOError(errnoCode: result, reason: "finishing a non-blocking connect failed")
+            throw IOError(socketErrorCode: result, reason: "finishing a non-blocking connect failed")
         }
     }
 
@@ -375,6 +375,23 @@ class Socket: BaseSocket, SocketProtocol {
         try self.withUnsafeHandle {
             try NIOBSDSocket.getUDPReceiveOffload(socket: $0)
         }
+    }
+}
+
+extension IOError {
+    /// The error a socket's pending error (`SO_ERROR`) stands for. On Windows that is a winsock
+    /// code, filed under its POSIX `errno` where there is one, so it reads and compares as on
+    /// other platforms instead of as an unknown `errno`.
+    init(socketErrorCode code: CInt, reason: String) {
+        #if os(Windows)
+        if let posixCode = posixErrno(forWinsock: code) {
+            self.init(errnoCode: posixCode, reason: reason)
+        } else {
+            self.init(winsock: code, reason: reason)
+        }
+        #else
+        self.init(errnoCode: code, reason: reason)
+        #endif
     }
 }
 #endif  // !os(WASI)

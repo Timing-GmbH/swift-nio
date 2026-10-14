@@ -74,17 +74,19 @@ public struct IOError: Swift.Error {
 
     /// The `errno` that was set for the operation.
     ///
-    /// - Warning: On Windows an `IOError` may instead carry a `windows`- or `winsock`-domain
-    ///   error code, for which there is no corresponding `errno`. Reading `errnoCode` in that
-    ///   case is a programmer error and traps with `fatalError`; inspect the error's domain
-    ///   before accessing this property on Windows.
+    /// On Windows an `IOError` may instead carry a `winsock`- or `windows`-domain code. For a
+    /// winsock code this is the POSIX `errno` of the same meaning where there is one, so callers
+    /// can compare it with `ECONNREFUSED` and friends as on other platforms; otherwise, and for
+    /// a Windows code, it is the code itself, which matches no POSIX constant.
     public var errnoCode: CInt {
         switch self.error {
         case .errno(let code):
             return code
         #if os(Windows)
-        default:
-            fatalError("IOError domain is not `errno`")
+        case .winsock(let code):
+            return posixErrno(forWinsock: code) ?? code
+        case .windows(let code):
+            return CInt(bitPattern: code)
         #endif
         }
     }
@@ -143,6 +145,47 @@ private func reasonForError(errnoCode: CInt, reason: String) -> String {
 }
 
 #if os(Windows)
+/// The POSIX `errno` with the same meaning as a winsock error code, or `nil` when there is none.
+/// The winsock codes are spelled as numbers so NIOCore need not import all of WinSDK.
+package func posixErrno(forWinsock code: CInt) -> CInt? {
+    switch code {
+    case 10004: return EINTR  // WSAEINTR
+    case 10009: return EBADF  // WSAEBADF
+    case 10013: return EACCES  // WSAEACCES
+    case 10014: return EFAULT  // WSAEFAULT
+    case 10022: return EINVAL  // WSAEINVAL
+    case 10024: return EMFILE  // WSAEMFILE
+    case 10035: return EWOULDBLOCK  // WSAEWOULDBLOCK
+    case 10036: return EINPROGRESS  // WSAEINPROGRESS
+    case 10037: return EALREADY  // WSAEALREADY
+    case 10038: return ENOTSOCK  // WSAENOTSOCK
+    case 10039: return EDESTADDRREQ  // WSAEDESTADDRREQ
+    case 10040: return EMSGSIZE  // WSAEMSGSIZE
+    case 10041: return EPROTOTYPE  // WSAEPROTOTYPE
+    case 10042: return ENOPROTOOPT  // WSAENOPROTOOPT
+    case 10043: return EPROTONOSUPPORT  // WSAEPROTONOSUPPORT
+    case 10045: return EOPNOTSUPP  // WSAEOPNOTSUPP
+    case 10047: return EAFNOSUPPORT  // WSAEAFNOSUPPORT
+    case 10048: return EADDRINUSE  // WSAEADDRINUSE
+    case 10049: return EADDRNOTAVAIL  // WSAEADDRNOTAVAIL
+    case 10050: return ENETDOWN  // WSAENETDOWN
+    case 10051: return ENETUNREACH  // WSAENETUNREACH
+    case 10052: return ENETRESET  // WSAENETRESET
+    case 10053: return ECONNABORTED  // WSAECONNABORTED
+    case 10054: return ECONNRESET  // WSAECONNRESET
+    case 10055: return ENOBUFS  // WSAENOBUFS
+    case 10056: return EISCONN  // WSAEISCONN
+    case 10057: return ENOTCONN  // WSAENOTCONN
+    case 10060: return ETIMEDOUT  // WSAETIMEDOUT
+    case 10061: return ECONNREFUSED  // WSAECONNREFUSED
+    case 10062: return ELOOP  // WSAELOOP
+    case 10063: return ENAMETOOLONG  // WSAENAMETOOLONG
+    case 10065: return EHOSTUNREACH  // WSAEHOSTUNREACH
+    case 10066: return ENOTEMPTY  // WSAENOTEMPTY
+    default: return nil
+    }
+}
+
 private func reasonForWinError(_ code: DWORD) -> String {
     let dwFlags: DWORD =
         DWORD(FORMAT_MESSAGE_ALLOCATE_BUFFER)

@@ -941,14 +941,13 @@ final class DatagramChannel: BaseSocketChannel<Socket>, @unchecked Sendable {
     override func error() -> ErrorResult {
         // Assume we can get the error from the socket.
         do {
-            let errnoCode: CInt = try self.socket.getOption(level: .socket, name: .so_error)
-            if self.shouldCloseOnErrnoCode(errnoCode) {
+            let socketErrorCode: CInt = try self.socket.getOption(level: .socket, name: .so_error)
+            let socketError = IOError(socketErrorCode: socketErrorCode, reason: "so_error")
+            if self.shouldCloseOnError(socketError.error) {
                 self.reset()
                 return .fatal
             } else {
-                self.pipeline.syncOperations.fireErrorCaught(
-                    IOError(errnoCode: errnoCode, reason: "so_error")
-                )
+                self.pipeline.syncOperations.fireErrorCaught(socketError)
                 return .nonFatal
             }
         } catch {
